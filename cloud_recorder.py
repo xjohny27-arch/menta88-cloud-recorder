@@ -1,3 +1,4 @@
+import base64
 import datetime
 import glob
 import json
@@ -43,15 +44,16 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
     email_user = os.environ.get("NOTIFY_EMAIL", "x.johny27@gmail.com").strip()
     email_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
-    if not email_pass:
-        log("[*] GMAIL_APP_PASSWORD secret not set; skipping email notification.")
+    resend_key = os.environ.get("RESEND_API_KEY", "").strip()
+    if not email_pass and not resend_key:
+        log("[*] Neither RESEND_API_KEY nor GMAIL_APP_PASSWORD is set; skipping email notification.")
         return
 
     msg = EmailMessage()
     msg["Subject"] = f"🎉 Menta 88 Magic Word ({window_label}): {word}"
     msg["From"] = email_user
     msg["To"] = email_user
-    msg.set_content(
+    body_text = (
         f"Βρέθηκε η μαγική λέξη του Menta 88!\n\n"
         f"Ώρα παραθύρου: {window_label}\n"
         f"Ώρα ομιλίας (εκτίμηση): {fmt(spoken_at)}\n"
@@ -59,6 +61,7 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
         f"Ακριβές απόσπασμα: \"{snippet}\"\n\n"
         f"Καταχώρησέ τη στο: https://menta88.gr/\n"
     )
+    msg.set_content(body_text)
 
     for path in attachments or []:
         try:
@@ -66,6 +69,39 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
                 msg.add_attachment(fh.read(), maintype="audio", subtype="mpeg", filename=os.path.basename(path))
         except Exception as exc:
             log(f"[!] Could not attach {path}: {exc}")
+
+    if resend_key:
+        try:
+            payload = {
+                "from": "Menta 88 <onboarding@resend.dev>",
+                "to": [email_user],
+                "subject": msg["Subject"],
+                "text": body_text,
+                "attachments": [
+                    {
+                        "filename": os.path.basename(path),
+                        "content": base64.b64encode(open(path, "rb").read()).decode(),
+                    }
+                    for path in (attachments or [])
+                    if os.path.exists(path)
+                ],
+            }
+            resp = requests.post(
+                "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {resend_key}"},
+                json=payload,
+                timeout=30,
+            )
+            if resp.status_code < 300:
+                log(f"[+] Email notification sent to {email_user} via Resend!")
+                return
+            log(f"[!] Resend failed ({resp.status_code}): {resp.text[:300]}")
+        except Exception as exc:
+            log(f"[!] Resend request failed: {exc}")
+
+    if not email_pass:
+        log("[!] No Gmail password set to fall back on; email not sent.")
+        return
 
     # Try SSL on port 465, then STARTTLS on port 587, two attempts each.
     for mode, port in [("ssl", 465), ("starttls", 587)]:
