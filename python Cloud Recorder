@@ -1,0 +1,43 @@
+name: Cloud Recorder
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-recorder:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python packages
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Run Recorder
+        run: |
+          python "Cloud Recorder"
+
+      - name: Upload Recorded Files
+        uses: actions/upload-artifact@v4
+        with:
+          name: recorded-audio
+          path: |
+            *.mp3
+            *.wav
+            *.m4a
+            output/
+          if-no-files-found: ignore
