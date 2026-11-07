@@ -45,6 +45,8 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
     email_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
     resend_key = os.environ.get("RESEND_API_KEY", "").strip()
+    log(f"[*] Email setup: RESEND_API_KEY {'found' if resend_key else 'NOT found'}, "
+        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 3.")
     if not email_pass and not resend_key:
         log("[*] Neither RESEND_API_KEY nor GMAIL_APP_PASSWORD is set; skipping email notification.")
         return
