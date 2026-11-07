@@ -169,6 +169,13 @@ def main() -> None:
         log("[*] Scheduled run outside any recording window (DST duplicate cron); exiting.")
         return
 
+    if os.environ.get("SEND_TEST_EMAIL", "false").lower() == "true":
+        log("[*] SEND_TEST_EMAIL enabled: sending a test email now.")
+        send_email_notification(
+            "TEST", "Δοκιμαστικό μήνυμα από το Menta 88 recorder", "TEST",
+            datetime.datetime.now(ATHENS_TZ),
+        )
+
     os.makedirs(SAVE_DIR, exist_ok=True)
     if not os.path.exists(MAGIC_WORDS_FILE):
         with open(MAGIC_WORDS_FILE, "w", encoding="utf-8") as mf:
