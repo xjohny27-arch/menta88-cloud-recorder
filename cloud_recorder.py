@@ -1,4 +1,6 @@
 import datetime
+import glob
+import json
 import os
 import queue
 import re
@@ -35,7 +37,8 @@ def fmt(dt: datetime.datetime) -> str:
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
-def send_email_notification(word: str, snippet: str, window_label: str, spoken_at: datetime.datetime) -> None:
+def send_email_notification(word: str, snippet: str, window_label: str, spoken_at: datetime.datetime,
+                            attachments: list[str] | None = None) -> None:
     """Sends an email alert via Gmail SMTP if GMAIL_APP_PASSWORD is set in GitHub Secrets."""
     email_user = os.environ.get("NOTIFY_EMAIL", "x.johny27@gmail.com").strip()
     email_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
@@ -57,13 +60,31 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
         f"Καταχώρησέ τη στο: https://menta88.gr/\n"
     )
 
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as smtp:
-            smtp.login(email_user, email_pass)
-            smtp.send_message(msg)
-        log(f"[+] Email notification sent to {email_user}!")
-    except Exception as exc:
-        log(f"[!] Failed to send email notification: {exc}")
+    for path in attachments or []:
+        try:
+            with open(path, "rb") as fh:
+                msg.add_attachment(fh.read(), maintype="audio", subtype="mpeg", filename=os.path.basename(path))
+        except Exception as exc:
+            log(f"[!] Could not attach {path}: {exc}")
+
+    # Try SSL on port 465, then STARTTLS on port 587, two attempts each.
+    for mode, port in [("ssl", 465), ("starttls", 587)]:
+        for attempt in (1, 2):
+            try:
+                if mode == "ssl":
+                    smtp_conn = smtplib.SMTP_SSL("smtp.gmail.com", port, timeout=20)
+                else:
+                    smtp_conn = smtplib.SMTP("smtp.gmail.com", port, timeout=20)
+                with smtp_conn as smtp:
+                    if mode == "starttls":
+                        smtp.starttls()
+                    smtp.login(email_user, email_pass)
+                    smtp.send_message(msg)
+                log(f"[+] Email notification sent to {email_user} (port {port}, {mode})!")
+                return
+            except Exception as exc:
+                log(f"[!] Email attempt {attempt} via port {port} ({mode}) failed: {exc}")
+    log("[!] All email attempts failed. Check GMAIL_APP_PASSWORD and the log lines above.")
 
 
 def append_to_magic_words_file(word: str, snippet: str, chunk_name: str, spoken_at: datetime.datetime) -> None:
@@ -97,6 +118,56 @@ def find_magic(pieces: list[tuple[datetime.datetime, str]]):
             return match, start_time
         cursor = end + 1  # account for the joining space
     return match, pieces[-1][0]
+
+
+def nearby_recordings(audio_path: str | None) -> list[str]:
+    """
+    The recording where the word was heard plus the minute before and after.
+    With no specific chunk (combined fallback), returns every recording of this run.
+    """
+    files = sorted(glob.glob(os.path.join(SAVE_DIR, "chunk_*.mp3")))
+    if audio_path is None or audio_path not in files:
+        return files
+    i = files.index(audio_path)
+    return files[max(0, i - 1): i + 2]
+
+
+def init_drive():
+    """Returns a Google Drive client if GDRIVE_SA_JSON is set, otherwise None."""
+    raw = os.environ.get("GDRIVE_SA_JSON", "").strip()
+    if not raw or not os.environ.get("GDRIVE_FOLDER_ID", "").strip():
+        log("[*] GDRIVE_SA_JSON / GDRIVE_FOLDER_ID not set; skipping Drive backup.")
+        return None
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+
+        creds = service_account.Credentials.from_service_account_info(
+            json.loads(raw), scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        log("[+] Google Drive backup enabled.")
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception as exc:
+        log(f"[!] Could not start Google Drive client: {exc}")
+        return None
+
+
+def upload_to_drive(service, path: str) -> None:
+    """Uploads one recording to the Drive folder. Failures are logged, never fatal."""
+    try:
+        from googleapiclient.http import MediaFileUpload
+
+        body = {
+            "name": os.path.basename(path),
+            "parents": [os.environ["GDRIVE_FOLDER_ID"].strip()],
+        }
+        media = MediaFileUpload(path, mimetype="audio/mpeg", resumable=False)
+        result = service.files().create(
+            body=body, media_body=media, fields="id,name", supportsAllDrives=True
+        ).execute()
+        log(f"[+] Uploaded to Drive: {result.get('name')}")
+    except Exception as exc:
+        log(f"[!] Drive upload failed for {os.path.basename(path)}: {exc}")
 
 
 def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
@@ -184,6 +255,7 @@ def main() -> None:
     log("Loading faster-whisper 'small' model (CPU int8)...")
     model = WhisperModel("small", device="cpu", compute_type="int8")
     log("Model ready.")
+    drive = init_drive()
 
     end_time, window_label = wait_for_window_or_run_test()
     log(f"[+] Έναρξη εγγραφής για το παράθυρο {window_label} (λήξη: {end_time.strftime('%H:%M:%S')})...")
@@ -192,7 +264,7 @@ def main() -> None:
     all_pieces: list[tuple[datetime.datetime, str]] = []  # every Whisper segment, in order
     found_words: list[str] = []
 
-    def handle_match(match, spoken_at: datetime.datetime, chunk_name: str) -> None:
+    def handle_match(match, spoken_at: datetime.datetime, chunk_name: str, audio_path: str | None) -> None:
         word = match.group(1).upper()
         log("=" * 60)
         log(f"🎉 ΒΡΕΘΗΚΕ! Η λέξη είναι: {word} (στο {chunk_name}, ~{fmt(spoken_at)}) 🎉")
@@ -200,7 +272,8 @@ def main() -> None:
         if word not in found_words:
             found_words.append(word)
             append_to_magic_words_file(word, match.group(0), chunk_name, spoken_at)
-            send_email_notification(word, match.group(0), window_label, spoken_at)
+            send_email_notification(word, match.group(0), window_label, spoken_at,
+                                    attachments=nearby_recordings(audio_path))
 
     def worker() -> None:
         while True:
@@ -223,9 +296,12 @@ def main() -> None:
                 log(f"  -> Whisper ({chunk_name}): {' '.join(t for _, t in pieces)}")
                 all_pieces.extend(pieces)
 
+                if drive is not None:
+                    upload_to_drive(drive, audio_path)
+
                 match, spoken_at = find_magic(pieces)
                 if match:
-                    handle_match(match, spoken_at, chunk_name)
+                    handle_match(match, spoken_at, chunk_name, audio_path)
             except Exception as exc:
                 log(f"[!] Transcription error ({audio_path}): {exc}")
             finally:
@@ -255,7 +331,8 @@ def main() -> None:
             word = match.group(1).upper()
             log(f"🎉 ΒΡΕΘΗΚΕ (στο συνολικό κείμενο)! Η λέξη είναι: {word} (~{fmt(spoken_at)}) 🎉")
             append_to_magic_words_file(word, match.group(0), "combined_session", spoken_at)
-            send_email_notification(word, match.group(0), window_label, spoken_at)
+            send_email_notification(word, match.group(0), window_label, spoken_at,
+                                    attachments=nearby_recordings(None))
         else:
             log("[-] Δεν εντοπίστηκε η φράση σε αυτό το παράθυρο.")
 
