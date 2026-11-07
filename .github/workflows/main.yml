@@ -48,7 +48,7 @@ jobs:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: "1E5clfjNGZwpabdVW9eTFL48yJDKQIWgB"
           SEND_TEST_EMAIL: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test_email || 'false' }}
-        run: .venv/bin/python cloud_recorder.py
+        run: .venv/bin/python cloud_recorder.py 
 
       - name: Commit magic_words.txt
         if: always()
