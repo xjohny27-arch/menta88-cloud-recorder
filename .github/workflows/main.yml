@@ -9,9 +9,8 @@ jobs:
     steps:
       - name: Run Script
         run: |
-          sudo apt-get update && sudo apt-get install -y ffmpeg
+          sudo apt-get update && sudo apt-get install -y ffmpeg python3-pip
           git clone https://github.com/xjohny27-arch/menta88-cloud-recorder.git temp_repo
-          python3 -m pip install --upgrade pip
           cd temp_repo
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f requirements.txt ]; then pip3 install -r requirements.txt; fi
           python3 "Cloud Recorder"
