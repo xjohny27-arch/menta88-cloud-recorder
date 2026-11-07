@@ -41,12 +41,12 @@ def fmt(dt: datetime.datetime) -> str:
 def send_email_notification(word: str, snippet: str, window_label: str, spoken_at: datetime.datetime,
                             attachments: list[str] | None = None) -> None:
     """Sends an email alert via Gmail SMTP if GMAIL_APP_PASSWORD is set in GitHub Secrets."""
-    email_user = os.environ.get("NOTIFY_EMAIL", "x.johny27@gmail.com").strip()
+    email_user = os.environ.get("NOTIFY_EMAIL", "").strip() or "x.johny27@gmail.com"
     email_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
     resend_key = os.environ.get("RESEND_API_KEY", "").strip()
     log(f"[*] Email setup: RESEND_API_KEY {'found' if resend_key else 'NOT found'}, "
-        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 3.")
+        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 4.")
     if not email_pass and not resend_key:
         log("[*] Neither RESEND_API_KEY nor GMAIL_APP_PASSWORD is set; skipping email notification.")
         return
