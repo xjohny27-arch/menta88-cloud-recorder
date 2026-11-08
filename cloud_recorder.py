@@ -20,8 +20,7 @@ MAGIC_WORDS_FILE = os.path.abspath("./magic_words.txt")
 CHUNK_DURATION = 60
 
 ATHENS_TZ = pytz.timezone("Europe/Athens")
-TARGET_HOURS = [8, 10, 12, 14, 18, 20]
-
+TARGET_HOURS = [8, 10, 12, 14, 16, 18, 20]
 # Tolerant regex that catches Whisper variations such as "ταξιβεύει" or "υαιόρκη"
 MAGIC_PATTERN = re.compile(
     r"λέξη.*?(?:ταξ\S+|όρκη|ορκη).*?είναι\s+(?:η\s+|το\s+|τα\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
