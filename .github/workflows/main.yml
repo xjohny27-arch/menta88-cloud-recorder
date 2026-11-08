@@ -2,12 +2,12 @@ name: Menta 88 recorder
 
 on:
   schedule:
-    # Athens windows start 07:55, 09:55, 11:55, 13:55, 17:55, 19:55.
+    # Athens windows start 07:55, 09:55, 11:55, 13:55, 15:55, 17:55, 19:55.
     # Primary trigger: 35 min early (:20) to absorb GitHub Actions queue delays.
     # Backup trigger: 10 min early (:45) in case GitHub skips the :20 slot.
     # Both UTC+2 (winter) and UTC+3 (summer) hours are listed.
-    - cron: "20 4,5,6,7,8,9,10,11,14,15,16,17 * * *"
-    - cron: "45 4,5,6,7,8,9,10,11,14,15,16,17 * * *"
+    - cron: "20 4,5,6,7,8,9,10,11,12,13,14,15,16,17 * * *"
+    - cron: "45 4,5,6,7,8,9,10,11,12,13,14,15,16,17 * * *"
   workflow_dispatch:
     inputs:
       test_now:
