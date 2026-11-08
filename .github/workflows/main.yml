@@ -2,18 +2,14 @@ name: Menta 88 recorder
 
 on:
   schedule:
-    # Athens windows start 07:55, 09:55, 11:55, 13:55, 15:55, 17:55, 19:55.
-    # Primary trigger: 35 min early (:20) to absorb GitHub Actions queue delays.
-    # Backup trigger: 10 min early (:45) in case GitHub skips the :20 slot.
-    # Both UTC+2 (winter) and UTC+3 (summer) hours are listed.
+    # Daily backup trigger; each run chains 12 shifts x 5.5h (~66 hours non-stop).
     - cron: "20 4,5,6,7,8,9,10,11,12,13,14,15,16,17 * * *"
-    - cron: "45 4,5,6,7,8,9,10,11,12,13,14,15,16,17 * * *"
   workflow_dispatch:
     inputs:
       test_now:
-        description: "Run a 2-minute test recording right now"
+        description: "Run a 2-minute test recording right now (leave unchecked for 24/7 auto-recording)"
         type: boolean
-        default: true
+        default: false
       send_test_email:
         description: "Send a test email to check Gmail setup"
         type: boolean
@@ -29,7 +25,12 @@ permissions:
 jobs:
   record:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        shift: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
     steps:
       # No third-party actions: plain git + the Python already on the runner.
       - name: Get the code
@@ -41,8 +42,9 @@ jobs:
           python3 -m venv .venv
           .venv/bin/pip install --quiet -r requirements.txt
 
-      - name: Record and transcribe
+      - name: Record and transcribe (Shift ${{ matrix.shift }})
         env:
+          SHIFT_NUM: ${{ matrix.shift }}
           RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           NOTIFY_EMAIL: ${{ secrets.NOTIFY_EMAIL }}
@@ -50,7 +52,7 @@ jobs:
           GDRIVE_SA_JSON: ${{ secrets.GDRIVE_SA_JSON }}
           GDRIVE_FOLDER_ID: "1E5clfjNGZwpabdVW9eTFL48yJDKQIWgB"
           SEND_TEST_EMAIL: ${{ github.event_name == 'workflow_dispatch' && inputs.send_test_email || 'false' }}
-        run: .venv/bin/python cloud_recorder.py 
+        run: .venv/bin/python cloud_recorder.py
 
       - name: Commit magic_words.txt
         if: always()
