@@ -228,7 +228,7 @@ def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
         return False
 
 
-EARLY_TRIGGER_MINUTES = 45
+EARLY_TRIGGER_MINUTES = 109
 
 
 def in_any_window(now: datetime.datetime) -> bool:
