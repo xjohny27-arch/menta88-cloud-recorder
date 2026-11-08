@@ -229,19 +229,22 @@ def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
         return False
 
 
+EARLY_TRIGGER_MINUTES = 45
+
+
 def in_any_window(now: datetime.datetime) -> bool:
     """True if `now` is inside an early-trigger -> window-end span for any target hour."""
     for target_hour in TARGET_HOURS:
         window_start = now.replace(hour=target_hour - 1, minute=55, second=0, microsecond=0)
         window_end = now.replace(hour=target_hour, minute=5, second=15, microsecond=0)
-        if window_start - datetime.timedelta(minutes=30) <= now <= window_end:
+        if window_start - datetime.timedelta(minutes=EARLY_TRIGGER_MINUTES) <= now <= window_end:
             return True
     return False
 
 
 def wait_for_window_or_run_test() -> tuple[datetime.datetime, str]:
     """
-    If triggered early by GitHub Actions cron (e.g. at :48), waits until :55 Athens time
+    If triggered early by GitHub Actions cron (e.g. at :20 or :45), waits until :55 Athens time
     and returns the end timestamp (:05 past the hour).
     If triggered manually outside a window, runs a 2-minute test immediately.
     """
@@ -256,7 +259,7 @@ def wait_for_window_or_run_test() -> tuple[datetime.datetime, str]:
     for target_hour in TARGET_HOURS:
         window_start = now.replace(hour=target_hour - 1, minute=55, second=0, microsecond=0)
         window_end = now.replace(hour=target_hour, minute=5, second=15, microsecond=0)
-        early_trigger_start = window_start - datetime.timedelta(minutes=30)
+        early_trigger_start = window_start - datetime.timedelta(minutes=EARLY_TRIGGER_MINUTES)
 
         if early_trigger_start <= now <= window_end:
             if now < window_start:
