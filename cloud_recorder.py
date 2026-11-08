@@ -6,6 +6,7 @@ import os
 import queue
 import re
 import smtplib
+import subprocess
 import threading
 import time
 from email.message import EmailMessage
@@ -21,6 +22,10 @@ CHUNK_DURATION = 60
 
 ATHENS_TZ = pytz.timezone("Europe/Athens")
 TARGET_HOURS = [8, 10, 12, 14, 16, 18, 20]
+
+SHIFT_DURATION_MINUTES = 330  # 5.5 hours per shift job (GitHub max is 360m)
+HANDOFF_BUFFER_MINUTES = 15   # hand off to next shift at least 15m before a window starts
+
 # Tolerant regex that catches Whisper variations such as "ταξιβεύει" or "υαιόρκη"
 MAGIC_PATTERN = re.compile(
     r"λέξη.*?(?:ταξ\S+|όρκη|ορκη).*?είναι\s+(?:η\s+|το\s+|τα\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
@@ -39,13 +44,13 @@ def fmt(dt: datetime.datetime) -> str:
 
 def send_email_notification(word: str, snippet: str, window_label: str, spoken_at: datetime.datetime,
                             attachments: list[str] | None = None) -> None:
-    """Sends an email alert via Gmail SMTP if GMAIL_APP_PASSWORD is set in GitHub Secrets."""
+    """Sends an email alert via Resend or Gmail SMTP."""
     email_user = os.environ.get("NOTIFY_EMAIL", "").strip() or "x.johny27@gmail.com"
     email_pass = os.environ.get("GMAIL_APP_PASSWORD", "").strip()
 
     resend_key = os.environ.get("RESEND_API_KEY", "").strip()
     log(f"[*] Email setup: RESEND_API_KEY {'found' if resend_key else 'NOT found'}, "
-        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 4.")
+        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 5.")
     if not email_pass and not resend_key:
         log("[*] Neither RESEND_API_KEY nor GMAIL_APP_PASSWORD is set; skipping email notification.")
         return
@@ -137,6 +142,26 @@ def append_to_magic_words_file(word: str, snippet: str, chunk_name: str, spoken_
         mf.write(entry)
 
 
+def commit_and_push_magic_words() -> None:
+    """Commits and pushes magic_words.txt immediately after a window finds a word."""
+    try:
+        status = subprocess.run(
+            ["git", "status", "--porcelain", "magic_words.txt"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if not status:
+            return
+        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=False)
+        subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=False)
+        subprocess.run(["git", "add", "magic_words.txt"], check=False)
+        subprocess.run(["git", "commit", "-m", "Update magic words"], check=False)
+        subprocess.run(["git", "pull", "--rebase"], check=False)
+        subprocess.run(["git", "push"], check=False)
+        log("[+] Pushed updated magic_words.txt to GitHub.")
+    except Exception as exc:
+        log(f"[!] Could not push magic_words.txt: {exc}")
+
+
 def find_magic(pieces: list[tuple[datetime.datetime, str]]):
     """
     pieces: (absolute start time of a Whisper segment, lowercased stripped text), in order.
@@ -160,13 +185,21 @@ def find_magic(pieces: list[tuple[datetime.datetime, str]]):
 def nearby_recordings(audio_path: str | None) -> list[str]:
     """
     The recording where the word was heard plus the minute before and after.
-    With no specific chunk (combined fallback), returns every recording of this run.
+    With no specific chunk (combined fallback), returns every recording of this window.
     """
     files = sorted(glob.glob(os.path.join(SAVE_DIR, "chunk_*.mp3")))
     if audio_path is None or audio_path not in files:
         return files
     i = files.index(audio_path)
     return files[max(0, i - 1): i + 2]
+
+
+def clear_old_recordings() -> None:
+    for f in glob.glob(os.path.join(SAVE_DIR, "chunk_*.mp3")):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
 
 def init_drive():
@@ -228,80 +261,49 @@ def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
         return False
 
 
-EARLY_TRIGGER_MINUTES = 109
-
-
-def in_any_window(now: datetime.datetime) -> bool:
-    """True if `now` is inside an early-trigger -> window-end span for any target hour."""
-    for target_hour in TARGET_HOURS:
-        window_start = now.replace(hour=target_hour - 1, minute=55, second=0, microsecond=0)
-        window_end = now.replace(hour=target_hour, minute=5, second=15, microsecond=0)
-        if window_start - datetime.timedelta(minutes=EARLY_TRIGGER_MINUTES) <= now <= window_end:
-            return True
-    return False
-
-
-def wait_for_window_or_run_test() -> tuple[datetime.datetime, str]:
+def get_next_window(now: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime, str]:
     """
-    If triggered early by GitHub Actions cron (e.g. at :20 or :45), waits until :55 Athens time
-    and returns the end timestamp (:05 past the hour).
-    If triggered manually outside a window, runs a 2-minute test immediately.
+    Returns (window_start, window_end, window_label) for the current or next upcoming
+    recording window in Athens time.
     """
-    now = datetime.datetime.now(ATHENS_TZ)
-    force_test = os.environ.get("TEST_NOW", "false").lower() == "true"
-
-    if force_test:
-        end_time = now + datetime.timedelta(minutes=2)
-        log("[*] TEST_NOW enabled: running 2-minute test recording immediately.")
-        return end_time, now.strftime("%Y-%m-%d %H:%M (TEST)")
-
-    for target_hour in TARGET_HOURS:
-        window_start = now.replace(hour=target_hour - 1, minute=55, second=0, microsecond=0)
-        window_end = now.replace(hour=target_hour, minute=5, second=15, microsecond=0)
-        early_trigger_start = window_start - datetime.timedelta(minutes=EARLY_TRIGGER_MINUTES)
-
-        if early_trigger_start <= now <= window_end:
-            if now < window_start:
-                wait_seconds = (window_start - now).total_seconds()
-                log(f"[*] Waiting {int(wait_seconds)}s until {window_start.strftime('%H:%M:%S')} Athens time...")
-                time.sleep(max(0, wait_seconds))
-            return window_end, f"{now.strftime('%Y-%m-%d')} {target_hour:02d}:00"
-
-    end_time = now + datetime.timedelta(minutes=2)
-    log("[*] Launched outside scheduled window; running 2-minute test recording.")
-    return end_time, now.strftime("%Y-%m-%d %H:%M (MANUAL)")
+    for day_offset in (0, 1, 2):
+        day = (now + datetime.timedelta(days=day_offset)).date()
+        for target_hour in TARGET_HOURS:
+            w_start = ATHENS_TZ.localize(
+                datetime.datetime(day.year, day.month, day.day, target_hour - 1, 55, 0)
+            )
+            w_end = ATHENS_TZ.localize(
+                datetime.datetime(day.year, day.month, day.day, target_hour, 5, 15)
+            )
+            if now <= w_end:
+                label = f"{day.strftime('%Y-%m-%d')} {target_hour:02d}:00"
+                return w_start, w_end, label
+    raise RuntimeError("No upcoming window found")
 
 
-def main() -> None:
-    if (
-        os.environ.get("GITHUB_EVENT_NAME") == "schedule"
-        and not in_any_window(datetime.datetime.now(ATHENS_TZ))
-    ):
-        log("[*] Scheduled run outside any recording window (DST duplicate cron); exiting.")
-        return
+def sleep_until(target: datetime.datetime, description: str) -> None:
+    """Sleeps until `target` Athens time, logging a heartbeat every 10 minutes."""
+    while True:
+        now = datetime.datetime.now(ATHENS_TZ)
+        remaining = (target - now).total_seconds()
+        if remaining <= 0:
+            break
+        if remaining > 600:
+            mins = int(remaining // 60)
+            log(f"[*] Αναμονή για {description} ({mins} λεπτά ακόμα, μέχρι {target.strftime('%H:%M:%S')})...")
+            time.sleep(min(600.0, remaining))
+        else:
+            log(f"[*] Αναμονή {int(remaining)}s μέχρι {target.strftime('%H:%M:%S')} ώρα Ελλάδας ({description})...")
+            time.sleep(remaining)
+            break
 
-    if os.environ.get("SEND_TEST_EMAIL", "false").lower() == "true":
-        log("[*] SEND_TEST_EMAIL enabled: sending a test email now.")
-        send_email_notification(
-            "TEST", "Δοκιμαστικό μήνυμα από το Menta 88 recorder", "TEST",
-            datetime.datetime.now(ATHENS_TZ),
-        )
 
-    os.makedirs(SAVE_DIR, exist_ok=True)
-    if not os.path.exists(MAGIC_WORDS_FILE):
-        with open(MAGIC_WORDS_FILE, "w", encoding="utf-8") as mf:
-            mf.write("# Menta 88 - Magic Words Log\n")
-
-    log("Loading faster-whisper 'small' model (CPU int8)...")
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    log("Model ready.")
-    drive = init_drive()
-
-    end_time, window_label = wait_for_window_or_run_test()
+def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime, window_label: str) -> None:
+    clear_old_recordings()
     log(f"[+] Έναρξη εγγραφής για το παράθυρο {window_label} (λήξη: {end_time.strftime('%H:%M:%S')})...")
 
     audio_queue: queue.Queue = queue.Queue()
-    all_pieces: list[tuple[datetime.datetime, str]] = []  # every Whisper segment, in order
+    all_pieces: list[tuple[datetime.datetime, str]] = []
     found_words: list[str] = []
 
     def handle_match(match, spoken_at: datetime.datetime, chunk_name: str, audio_path: str | None) -> None:
@@ -326,7 +328,6 @@ def main() -> None:
                 chunk_name = os.path.basename(audio_path)
                 segments, _ = model.transcribe(audio_path, language="el", beam_size=5)
 
-                # Convert each segment's offset (seconds into the chunk) to absolute Athens time
                 pieces = []
                 for seg in segments:
                     text = seg.text.strip().lower()
@@ -360,7 +361,7 @@ def main() -> None:
         else:
             time.sleep(3)
 
-    log("[*] Ολοκλήρωση παραθύρου. Αναμονή για τα τελευταία chunks...")
+    log(f"[*] Ολοκλήρωση παραθύρου {window_label}. Αναμονή για τα τελευταία chunks...")
     audio_queue.put(None)
     t.join()
 
@@ -374,7 +375,67 @@ def main() -> None:
             send_email_notification(word, match.group(0), window_label, spoken_at,
                                     attachments=nearby_recordings(None))
         else:
-            log("[-] Δεν εντοπίστηκε η φράση σε αυτό το παράθυρο.")
+            log(f"[-] Δεν εντοπίστηκε η φράση στο παράθυρο {window_label}.")
+
+
+def main() -> None:
+    shift_num = os.environ.get("SHIFT_NUM", "1").strip()
+    force_test = os.environ.get("TEST_NOW", "false").lower() == "true"
+    send_test = os.environ.get("SEND_TEST_EMAIL", "false").lower() == "true"
+
+    # If the user explicitly asked for a quick 2-minute test or test email, only run it in Shift 1
+    if (force_test or send_test) and shift_num != "1":
+        log(f"[*] Shift #{shift_num} skipped because TEST_NOW / SEND_TEST_EMAIL was only for Shift #1.")
+        return
+
+    if send_test:
+        log("[*] SEND_TEST_EMAIL enabled: sending a test email now.")
+        send_email_notification(
+            "TEST", "Δοκιμαστικό μήνυμα από το Menta 88 recorder", "TEST",
+            datetime.datetime.now(ATHENS_TZ),
+        )
+
+    os.makedirs(SAVE_DIR, exist_ok=True)
+    if not os.path.exists(MAGIC_WORDS_FILE):
+        with open(MAGIC_WORDS_FILE, "w", encoding="utf-8") as mf:
+            mf.write("# Menta 88 - Magic Words Log\n")
+
+    log("Loading faster-whisper 'small' model (CPU int8)...")
+    model = WhisperModel("small", device="cpu", compute_type="int8")
+    log("Model ready.")
+    drive = init_drive()
+
+    if force_test:
+        now = datetime.datetime.now(ATHENS_TZ)
+        end_time = now + datetime.timedelta(minutes=2)
+        log("[*] TEST_NOW enabled: running 2-minute test recording immediately.")
+        record_single_window(model, drive, end_time, now.strftime("%Y-%m-%d %H:%M (TEST)"))
+        commit_and_push_magic_words()
+        return
+
+    shift_start = datetime.datetime.now(ATHENS_TZ)
+    shift_deadline = shift_start + datetime.timedelta(minutes=SHIFT_DURATION_MINUTES)
+    log(f"[*] Βάρδια #{shift_num} ξεκίνησε στις {fmt(shift_start)} (διάρκεια έως {fmt(shift_deadline)})")
+
+    while True:
+        now = datetime.datetime.now(ATHENS_TZ)
+        w_start, w_end, window_label = get_next_window(now)
+
+        # If the next window finishes after our 5.5h shift deadline and hasn't started yet:
+        if w_end > shift_deadline and now < w_start:
+            handoff_time = min(shift_deadline, w_start - datetime.timedelta(minutes=HANDOFF_BUFFER_MINUTES))
+            if handoff_time > now:
+                log(f"[*] Το επόμενο παράθυρο ({window_label}) ολοκληρώνεται μετά το τέλος της Βάρδιας #{shift_num}.")
+                sleep_until(handoff_time, f"παράδοση σκυτάλης στη Βάρδια #{int(shift_num) + 1}")
+            log(f"[*] Ολοκλήρωση Βάρδιας #{shift_num}. Παράδοση στην επόμενη βάρδια...")
+            break
+
+        if now < w_start:
+            log(f"[*] Επόμενο προγραμματισμένο παράθυρο: {window_label} (έναρξη {w_start.strftime('%H:%M:%S')})")
+            sleep_until(w_start, f"έναρξη παραθύρου {window_label}")
+
+        record_single_window(model, drive, w_end, window_label)
+        commit_and_push_magic_words()
 
 
 if __name__ == "__main__":
