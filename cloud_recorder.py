@@ -270,18 +270,17 @@ def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
 
 def get_next_window(now: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime, str]:
     for h in TARGET_HOURS:
-        w_start = now.replace(hour=h, minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=5)
-        w_end = now.replace(hour=h, minute=5, second=15, microsecond=0)
+        # Έναρξη 10 λεπτά πριν (π.χ. 17:50:00) και λήξη 10 λεπτά μετά (π.χ. 18:10:00)
+        w_start = now.replace(hour=h, minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=10)
+        w_end = now.replace(hour=h, minute=10, second=0, microsecond=0)
         if now < w_end:
             return w_start, w_end, f"{now.strftime('%Y-%m-%d')} {h:02d}:00"
 
     tomorrow = now + datetime.timedelta(days=1)
     first_h = TARGET_HOURS[0]
-    w_start = tomorrow.replace(hour=first_h, minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=5)
-    w_end = tomorrow.replace(hour=first_h, minute=5, second=15, microsecond=0)
+    w_start = tomorrow.replace(hour=first_h, minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=10)
+    w_end = tomorrow.replace(hour=first_h, minute=10, second=0, microsecond=0)
     return w_start, w_end, f"{tomorrow.strftime('%Y-%m-%d')} {first_h:02d}:00"
-
-
 def sleep_until(target: datetime.datetime, description: str) -> None:
     while True:
         now = datetime.datetime.now(ATHENS_TZ)
