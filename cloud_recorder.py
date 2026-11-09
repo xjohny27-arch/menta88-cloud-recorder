@@ -36,8 +36,7 @@ STOPWORDS = {
     "ΧΡΙΣΤΟΥΓΕΝΝΑ", "ΔΙΑΓΩΝΙΣΜΟΣ", "ΔΙΑΓΩΝΙΣΜΟ", "ΔΙΑΓΩΝΙΣΜΟΥ", "ΤΑΞΙΔΙ"
 }
 
-# Matches "λέξη" followed within 0-10 words by "είναι" or ":" followed by the candidate word.
-# Prevents matching across ad breaks or distant sentences.
+# Matches "λέξη" followed within 0-25 words by "είναι" or ":" followed by the candidate word.
 MAGIC_PATTERN = re.compile(
     r"λέξη\s+(?:(?:\S+\s+){0,25}?)(?:είναι|:)\s+(?:η\s+|το\s+|τα\s+|ο\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
     re.IGNORECASE,
@@ -61,7 +60,7 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
 
     resend_key = os.environ.get("RESEND_API_KEY", "").strip()
     log(f"[*] Email setup: RESEND_API_KEY {'found' if resend_key else 'NOT found'}, "
-        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 5.1.")
+        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 5.2.")
     if not email_pass and not resend_key:
         log("[*] Neither RESEND_API_KEY nor GMAIL_APP_PASSWORD is set; skipping email notification.")
         return
@@ -196,10 +195,6 @@ def find_magic(pieces: list[tuple[datetime.datetime, str]]):
 
 
 def nearby_recordings(audio_path: str | None) -> list[str]:
-    """
-    The recording where the word was heard plus the minute before and after.
-    With no specific chunk (combined fallback), returns every recording of this window.
-    """
     files = sorted(glob.glob(os.path.join(SAVE_DIR, "chunk_*.mp3")))
     if audio_path is None or audio_path not in files:
         return files
@@ -216,94 +211,82 @@ def clear_old_recordings() -> None:
 
 
 def init_drive():
-    """Returns a Google Drive client if GDRIVE_SA_JSON is set, otherwise None."""
     raw = os.environ.get("GDRIVE_SA_JSON", "").strip()
-    if not raw or not os.environ.get("GDRIVE_FOLDER_ID", "").strip():
-        log("[*] GDRIVE_SA_JSON / GDRIVE_FOLDER_ID not set; skipping Drive backup.")
+    if not raw:
+        log("[*] GDRIVE_SA_JSON not set; skipping Google Drive uploads.")
         return None
     try:
         from google.oauth2 import service_account
         from googleapiclient.discovery import build
-
+        info = json.loads(raw)
         creds = service_account.Credentials.from_service_account_info(
-            json.loads(raw), scopes=["https://www.googleapis.com/auth/drive"]
+            info, scopes=["https://www.googleapis.com/auth/drive.file"]
         )
-        log("[+] Google Drive backup enabled.")
-        return build("drive", "v3", credentials=creds, cache_discovery=False)
+        service = build("drive", "v3", credentials=creds, cache_discovery=False)
+        log(f"[+] Google Drive enabled (service account: {info.get('client_email', 'unknown')}).")
+        return service
     except Exception as exc:
-        log(f"[!] Could not start Google Drive client: {exc}")
+        log(f"[!] Google Drive init failed: {exc}")
         return None
 
 
-def upload_to_drive(service, path: str) -> None:
-    """Uploads one recording to the Drive folder. Failures are logged, never fatal."""
+def upload_to_drive(drive_service, file_path: str) -> None:
+    folder_id = os.environ.get("GDRIVE_FOLDER_ID", "").strip()
+    if not folder_id:
+        return
     try:
         from googleapiclient.http import MediaFileUpload
-
-        body = {
-            "name": os.path.basename(path),
-            "parents": [os.environ["GDRIVE_FOLDER_ID"].strip()],
-        }
-        media = MediaFileUpload(path, mimetype="audio/mpeg", resumable=False)
-        result = service.files().create(
-            body=body, media_body=media, fields="id,name", supportsAllDrives=True
+        fname = os.path.basename(file_path)
+        media = MediaFileUpload(file_path, mimetype="audio/mpeg", resumable=False)
+        drive_service.files().create(
+            body={"name": fname, "parents": [folder_id]},
+            media_body=media,
+            fields="id",
         ).execute()
-        log(f"[+] Uploaded to Drive: {result.get('name')}")
+        log(f"[+] Uploaded to Google Drive: {fname}")
     except Exception as exc:
-        log(f"[!] Drive upload failed for {os.path.basename(path)}: {exc}")
+        log(f"[!] Drive upload failed for {file_path}: {exc}")
 
 
-def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://menta88.gr/",
-    }
-    try:
-        with requests.get(url, headers=headers, stream=True, timeout=15) as r:
-            r.raise_for_status()
-            start_time = time.time()
-            with open(output_file, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                    if time.time() - start_time >= duration:
-                        break
-        return True
-    except Exception as exc:
-        log(f"[!] Σφάλμα εγγραφής: {exc}")
+def record_chunk(out_path: str, duration: int) -> bool:
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "-headers", "Referer: https://menta88.gr/\r\n",
+        "-i", STREAM_URL,
+        "-t", str(duration),
+        "-c:a", "libmp3lame", "-b:a", "128k",
+        out_path,
+    ]
+    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if res.returncode != 0:
+        log(f"[!] ffmpeg error: {res.stderr.strip()[:200]}")
         return False
+    return os.path.exists(out_path) and os.path.getsize(out_path) > 1000
 
 
 def get_next_window(now: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime, str]:
-    """
-    Returns (window_start, window_end, window_label) for the current or next upcoming
-    recording window in Athens time.
-    """
-    for day_offset in (0, 1, 2):
-        day = (now + datetime.timedelta(days=day_offset)).date()
-        for target_hour in TARGET_HOURS:
-            w_start = ATHENS_TZ.localize(
-                datetime.datetime(day.year, day.month, day.day, target_hour - 1, 55, 0)
-            )
-            w_end = ATHENS_TZ.localize(
-                datetime.datetime(day.year, day.month, day.day, target_hour, 5, 15)
-            )
-            if now <= w_end:
-                label = f"{day.strftime('%Y-%m-%d')} {target_hour:02d}:00"
-                return w_start, w_end, label
-    raise RuntimeError("No upcoming window found")
+    for h in TARGET_HOURS:
+        w_start = now.replace(hour=h, minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=5)
+        w_end = now.replace(hour=h, minute=5, second=15, microsecond=0)
+        if now < w_end:
+            return w_start, w_end, f"{now.strftime('%Y-%m-%d')} {h:02d}:00"
+
+    tomorrow = now + datetime.timedelta(days=1)
+    first_h = TARGET_HOURS[0]
+    w_start = tomorrow.replace(hour=first_h, minute=0, second=0, microsecond=0) - datetime.timedelta(minutes=5)
+    w_end = tomorrow.replace(hour=first_h, minute=5, second=15, microsecond=0)
+    return w_start, w_end, f"{tomorrow.strftime('%Y-%m-%d')} {first_h:02d}:00"
 
 
 def sleep_until(target: datetime.datetime, description: str) -> None:
-    """Sleeps until `target` Athens time, logging a heartbeat every 10 minutes."""
     while True:
         now = datetime.datetime.now(ATHENS_TZ)
         remaining = (target - now).total_seconds()
         if remaining <= 0:
             break
         if remaining > 600:
-            mins = int(remaining // 60)
-            log(f"[*] Αναμονή για {description} ({mins} λεπτά ακόμα, μέχρι {target.strftime('%H:%M:%S')})...")
+            log(f"[*] Αναμονή {int(remaining // 60)}m μέχρι {target.strftime('%H:%M:%S')} ώρα Ελλάδας ({description})...")
             time.sleep(min(600.0, remaining))
         else:
             log(f"[*] Αναμονή {int(remaining)}s μέχρι {target.strftime('%H:%M:%S')} ώρα Ελλάδας ({description})...")
@@ -333,7 +316,6 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
         while True:
             item = audio_queue.get()
             if item is None:
-                audio_queue.task_done()
                 break
             audio_path, chunk_start = item
             try:
@@ -343,11 +325,10 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
                 pieces = []
                 for seg in segments:
                     text = seg.text.strip().lower()
-                    if text:
-                        pieces.append((chunk_start + datetime.timedelta(seconds=seg.start), text))
-
-                log(f"  -> Whisper ({chunk_name}): {' '.join(t for _, t in pieces)}")
-                all_pieces.extend(pieces)
+                    seg_start = chunk_start + datetime.timedelta(seconds=seg.start)
+                    pieces.append((seg_start, text))
+                    all_pieces.append((seg_start, text))
+                    log(f"[{fmt(seg_start)}] {text}")
 
                 if drive is not None:
                     upload_to_drive(drive, audio_path)
@@ -363,13 +344,14 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
+    chunk_idx = 0
     while datetime.datetime.now(ATHENS_TZ) < end_time:
         chunk_start = datetime.datetime.now(ATHENS_TZ)
-        now_str = chunk_start.strftime("%Y%m%d_%H%M%S")
-        chunk_path = os.path.join(SAVE_DIR, f"chunk_{now_str}.mp3")
-        if record_chunk(STREAM_URL, chunk_path, CHUNK_DURATION):
-            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1024:
-                audio_queue.put((chunk_path, chunk_start))
+        chunk_file = os.path.join(SAVE_DIR, f"chunk_{chunk_start.strftime('%Y%m%d_%H%M%S')}_{chunk_idx:03d}.mp3")
+        chunk_idx += 1
+        log(f"[*] Εγγραφή chunk {chunk_idx} ({CHUNK_DURATION}s)...")
+        if record_chunk(chunk_file, CHUNK_DURATION):
+            audio_queue.put((chunk_file, chunk_start))
         else:
             time.sleep(3)
 
@@ -389,12 +371,30 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
             log(f"[-] Δεν εντοπίστηκε η φράση στο παράθυρο {window_label}.")
 
 
+def load_best_whisper_model() -> WhisperModel:
+    """Tries loading large-v3-turbo / turbo first, falling back to medium or small."""
+    candidates = [
+        ("large-v3-turbo", "Large-v3-Turbo (State of the art)"),
+        ("turbo", "Turbo (Faster-Whisper alias)"),
+        ("medium", "Medium (High precision fallback)"),
+        ("small", "Small (Fast fallback)"),
+    ]
+    for model_name, desc in candidates:
+        try:
+            log(f"Loading Whisper model: {desc}...")
+            m = WhisperModel(model_name, device="cpu", compute_type="int8")
+            log(f"[+] Successfully loaded model: {model_name}")
+            return m
+        except Exception as exc:
+            log(f"[!] Could not load {model_name} ({exc}), trying next candidate...")
+    raise RuntimeError("Failed to load any Whisper model")
+
+
 def main() -> None:
     shift_num = os.environ.get("SHIFT_NUM", "1").strip()
     force_test = os.environ.get("TEST_NOW", "false").lower() == "true"
     send_test = os.environ.get("SEND_TEST_EMAIL", "false").lower() == "true"
 
-    # If the user explicitly asked for a quick 2-minute test or test email, only run it in Shift 1
     if (force_test or send_test) and shift_num != "1":
         log(f"[*] Shift #{shift_num} skipped because TEST_NOW / SEND_TEST_EMAIL was only for Shift #1.")
         return
@@ -411,9 +411,7 @@ def main() -> None:
         with open(MAGIC_WORDS_FILE, "w", encoding="utf-8") as mf:
             mf.write("# Menta 88 - Magic Words Log\n")
 
-    log("Loading faster-whisper 'small' model (CPU int8)...")
-    model = WhisperModel("small", device="cpu", compute_type="int8")
-    log("Model ready.")
+    model = load_best_whisper_model()
     drive = init_drive()
 
     if force_test:
@@ -432,7 +430,6 @@ def main() -> None:
         now = datetime.datetime.now(ATHENS_TZ)
         w_start, w_end, window_label = get_next_window(now)
 
-        # If the next window finishes after our 5.5h shift deadline and hasn't started yet:
         if w_end > shift_deadline and now < w_start:
             handoff_time = min(shift_deadline, w_start - datetime.timedelta(minutes=HANDOFF_BUFFER_MINUTES))
             if handoff_time > now:
