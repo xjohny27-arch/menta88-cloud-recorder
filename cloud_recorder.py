@@ -26,10 +26,21 @@ TARGET_HOURS = [8, 10, 12, 14, 16, 18, 20]
 SHIFT_DURATION_MINUTES = 330  # 5.5 hours per shift job (GitHub max is 360m)
 HANDOFF_BUFFER_MINUTES = 15   # hand off to next shift at least 15m before a window starts
 
-# Tolerant regex that catches Whisper variations such as "ταξιβεύει" or "υαιόρκη"
+# Common words and ad phrases that should never be identified as the magic word
+STOPWORDS = {
+    "ΚΑΘΕ", "ΜΕΡΑ", "ΣΤΙΣ", "ΣΤΟ", "ΚΑΙ", "ΓΙΑ", "ΠΟΥ", "ΣΕ", "ΝΑ", "ΜΕ", "ΑΠΟ",
+    "ΤΗΣ", "ΤΟΥ", "ΤΩΝ", "ΤΟΥΣ", "ΤΙΣ", "ΜΙΑ", "ΕΝΑ", "ΕΝΑΝ", "ΕΙΝΑΙ", "ΗΤΑΝ",
+    "ΟΧΙ", "ΝΑΙ", "ΕΔΩ", "ΕΚΕΙ", "ΤΩΡΑ", "ΜΕΤΑ", "ΠΡΙΝ", "ΜΕΣΑ", "ΕΞΩ", "ΖΩΝΤΑΝΟΣ",
+    "ΖΩΝΤΑΝΟ", "ΖΩΝΤΑΝΗ", "ΟΛΑ", "ΟΛΟΙ", "ΟΛΕΣ", "ΠΩΣ", "ΠΟΙΟΣ", "ΠΟΙΑ", "ΠΟΙΟ",
+    "MENTA", "MENTA88", "META", "META88", "GR", "WWW", "HTTP", "HTTPS", "RADIO",
+    "ΧΡΙΣΤΟΥΓΕΝΝΑ", "ΔΙΑΓΩΝΙΣΜΟΣ", "ΔΙΑΓΩΝΙΣΜΟ", "ΔΙΑΓΩΝΙΣΜΟΥ", "ΤΑΞΙΔΙ"
+}
+
+# Matches "λέξη" followed within 0-10 words by "είναι" or ":" followed by the candidate word.
+# Prevents matching across ad breaks or distant sentences.
 MAGIC_PATTERN = re.compile(
-    r"λέξη.*?(?:ταξ\S+|όρκη|ορκη).*?είναι\s+(?:η\s+|το\s+|τα\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
-    re.IGNORECASE | re.DOTALL,
+    r"λέξη\s+(?:(?:\S+\s+){0,10}?)(?:είναι|:)\s+(?:η\s+|το\s+|τα\s+|ο\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
+    re.IGNORECASE,
 )
 
 
@@ -50,7 +61,7 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
 
     resend_key = os.environ.get("RESEND_API_KEY", "").strip()
     log(f"[*] Email setup: RESEND_API_KEY {'found' if resend_key else 'NOT found'}, "
-        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 5.")
+        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 5.1.")
     if not email_pass and not resend_key:
         log("[*] Neither RESEND_API_KEY nor GMAIL_APP_PASSWORD is set; skipping email notification.")
         return
@@ -165,21 +176,23 @@ def commit_and_push_magic_words() -> None:
 def find_magic(pieces: list[tuple[datetime.datetime, str]]):
     """
     pieces: (absolute start time of a Whisper segment, lowercased stripped text), in order.
-    Returns (regex match, absolute time of the segment where the phrase starts), or (None, None).
+    Returns (word, snippet, spoken_at) or (None, None, None).
     """
     full = " ".join(text for _, text in pieces)
-    match = MAGIC_PATTERN.search(full)
-    if not match:
-        return None, None
-
-    pos = match.start()
-    cursor = 0
-    for start_time, text in pieces:
-        end = cursor + len(text)
-        if pos <= end:
-            return match, start_time
-        cursor = end + 1  # account for the joining space
-    return match, pieces[-1][0]
+    for match in MAGIC_PATTERN.finditer(full):
+        word = match.group(1).upper()
+        if len(word) >= 3 and word not in STOPWORDS:
+            pos = match.start()
+            cursor = 0
+            spoken_at = pieces[-1][0]
+            for start_time, text in pieces:
+                end = cursor + len(text)
+                if pos <= end:
+                    spoken_at = start_time
+                    break
+                cursor = end + 1
+            return word, match.group(0), spoken_at
+    return None, None, None
 
 
 def nearby_recordings(audio_path: str | None) -> list[str]:
@@ -306,15 +319,14 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
     all_pieces: list[tuple[datetime.datetime, str]] = []
     found_words: list[str] = []
 
-    def handle_match(match, spoken_at: datetime.datetime, chunk_name: str, audio_path: str | None) -> None:
-        word = match.group(1).upper()
+    def handle_match(word: str, snippet: str, spoken_at: datetime.datetime, chunk_name: str, audio_path: str | None) -> None:
         log("=" * 60)
         log(f"🎉 ΒΡΕΘΗΚΕ! Η λέξη είναι: {word} (στο {chunk_name}, ~{fmt(spoken_at)}) 🎉")
         log("=" * 60)
         if word not in found_words:
             found_words.append(word)
-            append_to_magic_words_file(word, match.group(0), chunk_name, spoken_at)
-            send_email_notification(word, match.group(0), window_label, spoken_at,
+            append_to_magic_words_file(word, snippet, chunk_name, spoken_at)
+            send_email_notification(word, snippet, window_label, spoken_at,
                                     attachments=nearby_recordings(audio_path))
 
     def worker() -> None:
@@ -340,9 +352,9 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
                 if drive is not None:
                     upload_to_drive(drive, audio_path)
 
-                match, spoken_at = find_magic(pieces)
-                if match:
-                    handle_match(match, spoken_at, chunk_name, audio_path)
+                word, snippet, spoken_at = find_magic(pieces)
+                if word:
+                    handle_match(word, snippet, spoken_at, chunk_name, audio_path)
             except Exception as exc:
                 log(f"[!] Transcription error ({audio_path}): {exc}")
             finally:
@@ -367,12 +379,11 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
 
     # Fallback: the phrase may have been split across two chunks
     if not found_words:
-        match, spoken_at = find_magic(all_pieces)
-        if match:
-            word = match.group(1).upper()
+        word, snippet, spoken_at = find_magic(all_pieces)
+        if word:
             log(f"🎉 ΒΡΕΘΗΚΕ (στο συνολικό κείμενο)! Η λέξη είναι: {word} (~{fmt(spoken_at)}) 🎉")
-            append_to_magic_words_file(word, match.group(0), "combined_session", spoken_at)
-            send_email_notification(word, match.group(0), window_label, spoken_at,
+            append_to_magic_words_file(word, snippet, "combined_session", spoken_at)
+            send_email_notification(word, snippet, window_label, spoken_at,
                                     attachments=nearby_recordings(None))
         else:
             log(f"[-] Δεν εντοπίστηκε η φράση στο παράθυρο {window_label}.")
