@@ -60,7 +60,7 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
 
     resend_key = os.environ.get("RESEND_API_KEY", "").strip()
     log(f"[*] Email setup: RESEND_API_KEY {'found' if resend_key else 'NOT found'}, "
-        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 5.2.")
+        f"GMAIL_APP_PASSWORD {'found' if email_pass else 'NOT found'}, script version 5.3.")
     if not email_pass and not resend_key:
         log("[*] Neither RESEND_API_KEY nor GMAIL_APP_PASSWORD is set; skipping email notification.")
         return
@@ -119,7 +119,6 @@ def send_email_notification(word: str, snippet: str, window_label: str, spoken_a
         log("[!] No Gmail password set to fall back on; email not sent.")
         return
 
-    # Try SSL on port 465, then STARTTLS on port 587, two attempts each.
     for mode, port in [("ssl", 465), ("starttls", 587)]:
         for attempt in (1, 2):
             try:
@@ -248,21 +247,25 @@ def upload_to_drive(drive_service, file_path: str) -> None:
         log(f"[!] Drive upload failed for {file_path}: {exc}")
 
 
-def record_chunk(out_path: str, duration: int) -> bool:
-    cmd = [
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "-headers", "Referer: https://menta88.gr/\r\n",
-        "-i", STREAM_URL,
-        "-t", str(duration),
-        "-c:a", "libmp3lame", "-b:a", "128k",
-        out_path,
-    ]
-    res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-    if res.returncode != 0:
-        log(f"[!] ffmpeg error: {res.stderr.strip()[:200]}")
+def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://menta88.gr/",
+    }
+    try:
+        with requests.get(url, headers=headers, stream=True, timeout=15) as r:
+            r.raise_for_status()
+            start_time = time.time()
+            with open(output_file, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                    if time.time() - start_time >= duration:
+                        break
+        return os.path.exists(output_file) and os.path.getsize(output_file) > 1000
+    except Exception as exc:
+        log(f"[!] Σφάλμα εγγραφής ({output_file}): {exc}")
         return False
-    return os.path.exists(out_path) and os.path.getsize(out_path) > 1000
 
 
 def get_next_window(now: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime, str]:
@@ -316,6 +319,7 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
         while True:
             item = audio_queue.get()
             if item is None:
+                audio_queue.task_done()
                 break
             audio_path, chunk_start = item
             try:
@@ -325,10 +329,11 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
                 pieces = []
                 for seg in segments:
                     text = seg.text.strip().lower()
-                    seg_start = chunk_start + datetime.timedelta(seconds=seg.start)
-                    pieces.append((seg_start, text))
-                    all_pieces.append((seg_start, text))
-                    log(f"[{fmt(seg_start)}] {text}")
+                    if text:
+                        pieces.append((chunk_start + datetime.timedelta(seconds=seg.start), text))
+
+                log(f"  -> Whisper ({chunk_name}): {' '.join(t for _, t in pieces)}")
+                all_pieces.extend(pieces)
 
                 if drive is not None:
                     upload_to_drive(drive, audio_path)
@@ -344,14 +349,14 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
-    chunk_idx = 0
     while datetime.datetime.now(ATHENS_TZ) < end_time:
         chunk_start = datetime.datetime.now(ATHENS_TZ)
-        chunk_file = os.path.join(SAVE_DIR, f"chunk_{chunk_start.strftime('%Y%m%d_%H%M%S')}_{chunk_idx:03d}.mp3")
-        chunk_idx += 1
-        log(f"[*] Εγγραφή chunk {chunk_idx} ({CHUNK_DURATION}s)...")
-        if record_chunk(chunk_file, CHUNK_DURATION):
-            audio_queue.put((chunk_file, chunk_start))
+        now_str = chunk_start.strftime("%Y%m%d_%H%M%S")
+        chunk_path = os.path.join(SAVE_DIR, f"chunk_{now_str}.mp3")
+        log(f"[*] Εγγραφή chunk ({CHUNK_DURATION}s)...")
+        if record_chunk(STREAM_URL, chunk_path, CHUNK_DURATION):
+            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1024:
+                audio_queue.put((chunk_path, chunk_start))
         else:
             time.sleep(3)
 
