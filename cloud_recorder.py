@@ -39,7 +39,7 @@ STOPWORDS = {
 # Matches "λέξη" followed within 0-10 words by "είναι" or ":" followed by the candidate word.
 # Prevents matching across ad breaks or distant sentences.
 MAGIC_PATTERN = re.compile(
-    r"λέξη\s+(?:(?:\S+\s+){0,10}?)(?:είναι|:)\s+(?:η\s+|το\s+|τα\s+|ο\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
+    r"λέξη\s+(?:(?:\S+\s+){0,25}?)(?:είναι|:)\s+(?:η\s+|το\s+|τα\s+|ο\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
     re.IGNORECASE,
 )
 
