@@ -32,13 +32,13 @@ STOPWORDS = {
     "ΤΗΣ", "ΤΟΥ", "ΤΩΝ", "ΤΟΥΣ", "ΤΙΣ", "ΜΙΑ", "ΕΝΑ", "ΕΝΑΝ", "ΕΙΝΑΙ", "ΗΤΑΝ",
     "ΟΧΙ", "ΝΑΙ", "ΕΔΩ", "ΕΚΕΙ", "ΤΩΡΑ", "ΜΕΤΑ", "ΠΡΙΝ", "ΜΕΣΑ", "ΕΞΩ", "ΖΩΝΤΑΝΟΣ",
     "ΖΩΝΤΑΝΟ", "ΖΩΝΤΑΝΗ", "ΟΛΑ", "ΟΛΟΙ", "ΟΛΕΣ", "ΠΩΣ", "ΠΟΙΟΣ", "ΠΟΙΑ", "ΠΟΙΟ",
-    "MENTA", "MENTA88", "META", "META88", "GR", "WWW", "HTTP", "HTTPS", "RADIO",
-    "ΧΡΙΣΤΟΥΓΕΝΝΑ", "ΔΙΑΓΩΝΙΣΜΟΣ", "ΔΙΑΓΩΝΙΣΜΟ", "ΔΙΑΓΩΝΙΣΜΟΥ", "ΤΑΞΙΔΙ"
+    "MENTA88", "META88", "GR", "WWW", "HTTP", "HTTPS", "RADIO",
+    "ΔΙΑΓΩΝΙΣΜΟΣ", "ΔΙΑΓΩΝΙΣΜΟ", "ΔΙΑΓΩΝΙΣΜΟΥ"
 }
 
 # Matches "λέξη" followed within 0-25 words by "είναι" or ":" followed by the candidate word.
 MAGIC_PATTERN = re.compile(
-    r"λέξη\s+(?:(?:\S+\s+){0,25}?)(?:είναι|:)\s+(?:η\s+|το\s+|τα\s+|ο\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z]+)",
+    r"λέξη\s+(?:(?:\S+\s+){0,25}?)(?:είναι\s*[:,.\-]?|:)\s+(?:η\s+|το\s+|τα\s+|ο\s+)?([α-ωάέήίόύώϊϋΐΰa-zA-Z0-9]+)",
     re.IGNORECASE,
 )
 
@@ -268,6 +268,44 @@ def record_chunk(url: str, output_file: str, duration: int = 60) -> bool:
         return False
 
 
+def stream_window_chunks(
+    url: str,
+    end_time: datetime.datetime,
+    chunk_duration: int,
+    audio_queue: queue.Queue,
+) -> None:
+    """Keeps a single HTTP stream open across the whole window and rotates MP3 files without gaps."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Referer": "https://menta88.gr/",
+    }
+    while datetime.datetime.now(ATHENS_TZ) < end_time:
+        try:
+            with requests.get(url, headers=headers, stream=True, timeout=15) as r:
+                r.raise_for_status()
+                it = r.iter_content(chunk_size=8192)
+                while datetime.datetime.now(ATHENS_TZ) < end_time:
+                    chunk_start = datetime.datetime.now(ATHENS_TZ)
+                    now_str = chunk_start.strftime("%Y%m%d_%H%M%S")
+                    chunk_path = os.path.join(SAVE_DIR, f"chunk_{now_str}.mp3")
+                    log(f"[*] Εγγραφή chunk ({chunk_duration}s)...")
+                    start_ts = time.time()
+                    with open(chunk_path, "wb") as f:
+                        for data in it:
+                            if data:
+                                f.write(data)
+                            if (time.time() - start_ts >= chunk_duration
+                                    or datetime.datetime.now(ATHENS_TZ) >= end_time):
+                                break
+                    if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1024:
+                        audio_queue.put((chunk_path, chunk_start))
+                    else:
+                        break
+        except Exception as exc:
+            log(f"[!] Σφάλμα ροής/εγγραφής: {exc}")
+            time.sleep(3)
+
+
 def get_next_window(now: datetime.datetime) -> tuple[datetime.datetime, datetime.datetime, str]:
     for h in TARGET_HOURS:
         # Έναρξη 10 λεπτά πριν (π.χ. 17:50:00) και λήξη 10 λεπτά μετά (π.χ. 18:10:00)
@@ -323,7 +361,23 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
             audio_path, chunk_start = item
             try:
                 chunk_name = os.path.basename(audio_path)
-                segments, _ = model.transcribe(audio_path, language="el", beam_size=5)
+                try:
+                    segments, _ = model.transcribe(
+                        audio_path,
+                        language="el",
+                        beam_size=5,
+                        vad_filter=True,
+                        condition_on_previous_text=False,
+                        initial_prompt="Menta 88. Η ώρα είναι. Η λέξη που σε ταξιδεύει στη Νέα Υόρκη είναι.",
+                    )
+                except TypeError:
+                    segments, _ = model.transcribe(
+                        audio_path,
+                        language="el",
+                        beam_size=5,
+                        condition_on_previous_text=False,
+                        initial_prompt="Menta 88. Η ώρα είναι. Η λέξη που σε ταξιδεύει στη Νέα Υόρκη είναι.",
+                    )
 
                 pieces = []
                 for seg in segments:
@@ -348,16 +402,7 @@ def record_single_window(model: WhisperModel, drive, end_time: datetime.datetime
     t = threading.Thread(target=worker, daemon=True)
     t.start()
 
-    while datetime.datetime.now(ATHENS_TZ) < end_time:
-        chunk_start = datetime.datetime.now(ATHENS_TZ)
-        now_str = chunk_start.strftime("%Y%m%d_%H%M%S")
-        chunk_path = os.path.join(SAVE_DIR, f"chunk_{now_str}.mp3")
-        log(f"[*] Εγγραφή chunk ({CHUNK_DURATION}s)...")
-        if record_chunk(STREAM_URL, chunk_path, CHUNK_DURATION):
-            if os.path.exists(chunk_path) and os.path.getsize(chunk_path) > 1024:
-                audio_queue.put((chunk_path, chunk_start))
-        else:
-            time.sleep(3)
+    stream_window_chunks(STREAM_URL, end_time, CHUNK_DURATION, audio_queue)
 
     log(f"[*] Ολοκλήρωση παραθύρου {window_label}. Αναμονή για τα τελευταία chunks...")
     audio_queue.put(None)
